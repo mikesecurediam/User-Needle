@@ -1,0 +1,42 @@
+SigninLogs
+| where TimeGenerated > ago (30d)
+| where NetworkLocationDetails == "[]" // or tostring(Status.AutonomousSystemNumber) != "<ASN>" // where requests NOT coming from a known network
+//Step 1 - Count failed password attempts/account lock outs in a given time window
+| where ResultType == "50126" or ResultType == "50053"
+| summarize PasswordFailures = count() by bin(TimeGenerated, 7d), UserPrincipalName
+| extend SuspectedPasswordSpray = iff((PasswordFailures > 21), "True", "False") //Password Spray could be low and slow so count over a longer time period.
+//Step 2 - Join MFA Failures for that user in the time window
+| join kind= leftouter           
+    (SigninLogs
+    | where TimeGenerated > ago (30d)
+    | where ResultType == "500121" and Status.additionalDetails contains "MFA denied" //captures user did not respond, timeout or user MFA is blocked
+    | summarize MFAFailures = count() by bin(TimeGenerated, 4h), UserPrincipalName 
+    | extend SuspectedMFAFatigue = iff((MFAFailures > 5), "True", "False") //MFA Fatigue attack tends to hammer the user so count over shorter time window
+    ) on UserPrincipalName
+        //Step 3 - Join when successful auth occurs for an app that had previously failed auth
+        | join kind= leftouter         
+            (SigninLogs
+            | where TimeGenerated > ago(30d)
+            | summarize AppStatus=make_set(tostring(ResultType)) by UserPrincipalName
+            //Looking for failed and successful auth for an app in the time period
+            | extend AppFailThenSuccess = iff((AppStatus has "0" and AppStatus contains "50"), "True", "False")
+             ) on UserPrincipalName
+            //Step 4 - Join if MultiLocation detected in time window for these logs
+            | join kind= leftouter       
+                (SigninLogs
+                | where TimeGenerated > ago (30d)
+                | summarize Locations = make_set(LocationDetails.countryOrRegion) by UserPrincipalName
+                | extend MultiLocation = iff((array_length(Locations) > 1), "True", "False")
+                ) on UserPrincipalName
+                //Step 5 - Join if user has reported MFA Fraud or Suspicious Activity
+                | join kind= leftouter    
+                    (SigninLogs
+                    | where TimeGenerated > ago (30d)
+                    | where ResultType == "500121" and Status.additionalDetails contains "Fraud" or AuthenticationDetails contains "SuspiciousActivityReported" 
+                    //captures SuspiciousActivityReported and Reported Fraud
+                    | summarize MFAFraud = count() by bin(TimeGenerated, 24h), UserPrincipalName 
+                    | extend ReportedMFAFraud = iff((MFAFraud > 0), "True", "False") 
+                    ) on UserPrincipalName
+| where SuspectedPasswordSpray == "True" and SuspectedMFAFatigue == "True" or ReportedMFAFraud == "True" //Tweak to your needs
+| project PasswordFailTimeWindow = TimeGenerated, MFAFailTimeWindow = TimeGenerated1, UserPrincipalName, ReportedMFAFraud, SuspectedPasswordSpray, SuspectedMFAFatigue, AppFailThenSuccess, MultiLocation, Locations 
+| sort by ReportedMFAFraud, MultiLocation, tostring(Locations)
